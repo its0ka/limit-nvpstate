@@ -1,3 +1,4 @@
+#include <utils.h>
 #include <QMessageBox>
 #include <Shlwapi.h>
 #include <Psapi.h>
@@ -67,12 +68,15 @@ int addToStartup(bool isEnabled) {
 }
 
 std::string toLower(std::string str) {
-    std::string lowerString = str;
+    // unicode aware (the UTF-8 string is lowered as UTF-16), so non-ASCII names match case-insensitively
+    std::wstring wide = stringToWString(str);
 
-    std::transform(lowerString.begin(), lowerString.end(), lowerString.begin(),
-        [](unsigned char c) { return std::tolower(c); });
+    if (wide.empty()) {
+        return str;
+    }
 
-    return lowerString;
+    CharLowerBuffW(&wide[0], static_cast<DWORD>(wide.size()));
+    return wStringToString(wide);
 }
 
 std::string getBaseName(std::string& fullPath) {
@@ -133,4 +137,41 @@ std::string getProcessNameByPID(DWORD pid) {
 
     CloseHandle(hSnapshot);
     return processName;
+}
+
+std::wstring stringToWString(const std::string& str) {
+    if (str.empty()) {
+        return L"";
+    }
+
+    int requiredSize = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, NULL, 0);
+
+    if (requiredSize == 0) {
+        return L"";
+    }
+
+    std::wstring wstr(requiredSize - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, &wstr[0], requiredSize);
+    return wstr;
+}
+
+std::string getProcessImagePath(DWORD pid) {
+    // PROCESS_QUERY_LIMITED_INFORMATION works for far more processes than PROCESS_QUERY_INFORMATION
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+
+    if (!hProcess) {
+        return "";
+    }
+
+    std::wstring path(32768, L'\0');
+    DWORD size = static_cast<DWORD>(path.size());
+    BOOL ok = QueryFullProcessImageNameW(hProcess, 0, &path[0], &size);
+    CloseHandle(hProcess);
+
+    if (!ok) {
+        return "";
+    }
+
+    path.resize(size);
+    return wStringToString(path);
 }

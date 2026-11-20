@@ -1,7 +1,8 @@
 #pragma once
 
 #include <ui_limitnvpstate.h>
-#include <unordered_set>
+#include <vector>
+#include <rules.h>
 
 class limitnvpstate : public QMainWindow {
     Q_OBJECT
@@ -17,14 +18,22 @@ private:
     void setupProcessForegroundTrigger();
     void stopProcessForegroundTrigger();
     void createTrayIcon();
-    void saveProcessExceptions();
+    void saveProcessRules();
+    void refreshRuleList();
+    void reevaluatePState();
     void getAvailablePStates();
+
+    // process-specific P-State overrides (same order as the list widget)
+    std::vector<ProcessRule> processRules;
+    // P-States of the selected GPU that can be used as a limit (excludes P0)
+    std::vector<int> availablePStates;
 
 private slots:
     void unlimitTriggerChanged(int index);
     void selectedGPUChanged(int index);
     void selectedPStateChanged(int index);
     void addProcess();
+    void editProcess();
     void exitApp(int exitCode);
 
 protected:

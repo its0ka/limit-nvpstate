@@ -60,10 +60,10 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|x64'">
-    <IncludePath>$(SolutionDir)vcpkg_installed\x64-windows\include;$(SolutionDir)nvapi;$(IncludePath)</IncludePath>
+    <IncludePath>$(SolutionDir)vcpkg_installed\x64-windows\include;$(SolutionDir)third_party;$(SolutionDir)nvapi;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release|x64'">
-    <IncludePath>$(SolutionDir)vcpkg_installed\x64-windows\include;$(SolutionDir)nvapi;$(IncludePath)</IncludePath>
+    <IncludePath>$(SolutionDir)vcpkg_installed\x64-windows\include;$(SolutionDir)third_party;$(SolutionDir)nvapi;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -117,6 +117,8 @@
     <ClCompile Include="about.cpp" />
     <ClCompile Include="config.cpp" />
     <ClCompile Include="nvidia.cpp" />
+    <ClCompile Include="rules.cpp" />
+    <ClCompile Include="ruledialog.cpp" />
     <ClCompile Include="utils.cpp" />
     <QtRcc Include="limitnvpstate.qrc" />
     <QtUic Include="about.ui" />
@@ -129,6 +131,8 @@
     <QtMoc Include="about.h" />
     <ClInclude Include="config.h" />
     <ClInclude Include="nvidia.h" />
+    <ClInclude Include="rules.h" />
+    <ClInclude Include="ruledialog.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="utils.h" />
   </ItemGroup>

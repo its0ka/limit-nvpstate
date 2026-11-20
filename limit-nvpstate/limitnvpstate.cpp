@@ -4,92 +4,107 @@
 #include <QMessageBox>
 #include <config.h>
 #include <utils.h>
+#include <rules.h>
+#include <ruledialog.h>
 #include <QFileDialog>
 #include <QCloseEvent>
+#include <QSignalBlocker>
 #include <about.h>
 #include <tlhelp32.h>
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
-std::unordered_set<std::string> cachedProcessExceptions;
 NvPhysicalGpuHandle hPhysicalGpus[NVAPI_MAX_PHYSICAL_GPUS];
 HWINEVENTHOOK eventHook;
 std::string unlimitTriggers[] = { "Process Running", "Process Foreground" };
-std::atomic<bool> isThreadRunning(true); // control process running thread
 
-void WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
-    // this corrects the hwnd after a EVENT_SYSTEM_FOREGROUND event
-    hwnd = GetForegroundWindow();
+// mirrors of config values that are read from other threads / the hook callback
+std::atomic<int> activeGpuIndex(0);
+std::atomic<int> globalPStateLimit(8);
 
-    DWORD pid;
-    GetWindowThreadProcessId(hwnd, &pid);
+// process running polling thread
+// heap allocated and never destroyed implicitly, so exit() while the thread runs cannot terminate the process
+std::thread* pollThread = nullptr;
+std::mutex pollMutex;
+std::condition_variable pollCondition;
+bool pollStop = false;
+bool pollWakeUp = false;
 
-    std::string processName = toLower(getProcessNameByPID(pid));
-    bool isProcessExcepted = cachedProcessExceptions.count(processName);
+// applies the P-State of the matched rule, or the global limit if no rule matched (rulePState < 0)
+void applyPState(int rulePState) {
+    unsigned int limit = rulePState >= 0 ? rulePState : globalPStateLimit.load();
 
-    std::cout << "info: " << processName << " is fg window (excepted: " << std::boolalpha << isProcessExcepted << ")\n";
-
-    if (setPState(hPhysicalGpus[config["gpu_index"]], isProcessExcepted, config["pstate_limit"]) != 0) {
+    if (setPState(hPhysicalGpus[activeGpuIndex], limit) != 0) {
         QMessageBox::critical(nullptr, "limit-nvpstate", "Error: Failed to set P-State");
         exit(1);
     }
 }
 
+void applyForegroundState() {
+    HWND hwnd = GetForegroundWindow();
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+
+    std::string processName = getProcessNameByPID(pid);
+    int rulePState = findRulePState(processName, pid);
+
+    std::cout << "info: " << processName << " is fg window (rule P-State: " << rulePState << ")\n";
+
+    applyPState(rulePState);
+}
+
+void WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
+    // the foreground window is queried again because it can differ from the event's hwnd
+    applyForegroundState();
+}
+
 void pollProcesses() {
-    while (isThreadRunning) {
-        bool isUnlimit = false;
+    const int pollingInterval = (std::max)(100, config["process_running_polling"].get<int>());
+
+    std::unique_lock<std::mutex> lock(pollMutex);
+
+    while (!pollStop) {
+        lock.unlock();
+
+        // the lowest P-State number of all running processes with a matching rule wins
+        int bestPState = -1;
 
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 
-        if (!hSnapshot) {
-            QMessageBox::critical(nullptr, "limit-nvpstate", "Error: CreateToolhelp32Snapshot failed");
-            exit(1);
-        }
+        if (hSnapshot != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32 processEntry;
+            processEntry.dwSize = sizeof(PROCESSENTRY32);
 
-        std::string processName = "";
-        unsigned long processId = -1;
+            if (Process32First(hSnapshot, &processEntry)) {
+                do {
+                    int rulePState = findRulePState(wStringToString(processEntry.szExeFile), processEntry.th32ProcessID);
 
-        PROCESSENTRY32 processEntry;
-        processEntry.dwSize = sizeof(PROCESSENTRY32);
+                    if (rulePState >= 0 && (bestPState < 0 || rulePState < bestPState)) {
+                        bestPState = rulePState;
+                    }
 
-        if (Process32First(hSnapshot, &processEntry)) {
-            do {
-                processName = toLower(wStringToString(processEntry.szExeFile));
-                bool isProcessExcepted = cachedProcessExceptions.count(processName);
-
-                std::cout << "info: " << processName << " is running (excepted: " << std::boolalpha << isProcessExcepted << ")\n";
-
-                if (isProcessExcepted) {
-                    isUnlimit = true;
-                    processId = processEntry.th32ProcessID;
-                    break;
-                }
-            } while (Process32Next(hSnapshot, &processEntry));
-        }
-
-        CloseHandle(hSnapshot);
-
-        if (setPState(hPhysicalGpus[config["gpu_index"]], isUnlimit, config["pstate_limit"]) != 0) {
-            QMessageBox::critical(nullptr, "limit-nvpstate", "Error: Failed to set P-State");
-            exit(1);
-        }
-
-        // wait for process to exit
-        if (processId >= 0) {
-            HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, processId);
-
-            if (hProcess) {
-                std::cout << "info: waiting for " << processName << " to exit\n";
-                WaitForSingleObject(hProcess, INFINITE); // wait indefinitely for the process to exit
-                std::cout << "info: " << processName << " exited\n";
-                CloseHandle(hProcess);
-            } else {
-                std::cerr << "info: failed to open process: " << processName << " \n";
+                    // nothing is faster than unlimited
+                    if (bestPState == 0) {
+                        break;
+                    }
+                } while (Process32Next(hSnapshot, &processEntry));
             }
+
+            CloseHandle(hSnapshot);
+            applyPState(bestPState);
         } else {
-            std::cerr << "info: failed to get PID: " << processName << " \n";
+            std::cerr << "error: CreateToolhelp32Snapshot failed\n";
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(config["process_running_polling"]));
+        lock.lock();
+
+        // sleep until the next poll, rule/setting changes and stopping wake the thread up early
+        pollCondition.wait_for(lock, std::chrono::milliseconds(pollingInterval), []() { return pollStop || pollWakeUp; });
+        pollWakeUp = false;
     }
 }
 
@@ -152,12 +167,13 @@ limitnvpstate::limitnvpstate(QWidget* parent) : QMainWindow(parent) {
         ui.selectedGPU->addItem(gpuFullName);
     }
 
-    if (!(config["gpu_index"] >= (gpuCount - 1) && config["gpu_index"] <= (gpuCount - 1))) {
+    if (config["gpu_index"] < 0 || config["gpu_index"] >= (int)gpuCount) {
         config["gpu_index"] = 0;
         saveConfig();
     }
 
-    ui.selectedGPU->setCurrentIndex(config["gpu_index"]);
+    activeGpuIndex = config["gpu_index"].get<int>();
+    ui.selectedGPU->setCurrentIndex(activeGpuIndex);
     connect(ui.selectedGPU, SIGNAL(currentIndexChanged(int)), this, SLOT(selectedGPUChanged(int)));
 
     // add P-States to combobox
@@ -178,33 +194,65 @@ limitnvpstate::limitnvpstate(QWidget* parent) : QMainWindow(parent) {
     ui.unlimitTrigger->setCurrentIndex(config["unlimit_trigger"]);
     connect(ui.unlimitTrigger, SIGNAL(currentIndexChanged(int)), this, SLOT(unlimitTriggerChanged(int)));
 
-    // add process button
-    for (std::string processException : config["process_exceptions"]) {
-        ui.processExceptionsList->addItem(QString::fromStdString(processException));
+    // process rules (list of exceptions with their own P-State)
+    ui.processExceptionsList->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    ui.processExceptionsList->setTextElideMode(Qt::ElideMiddle);
 
-        // when the foreground window is changed, the lowercase name of it is compared
-        cachedProcessExceptions.insert(toLower(processException));
+    bool isConfigMigrated = false;
+    processRules = loadRulesFromConfig(isConfigMigrated);
+
+    // a P-State that isn't available for the GPU can't be applied, fall back to unlimited
+    for (ProcessRule& rule : processRules) {
+        if (rule.pstate != 0 && std::find(availablePStates.begin(), availablePStates.end(), rule.pstate) == availablePStates.end()) {
+            std::cerr << "info: P" << rule.pstate << " of " << rule.pattern << " is not available, using P0\n";
+            rule.pstate = 0;
+            isConfigMigrated = true;
+        }
     }
 
+    if (isConfigMigrated) {
+        // old config format or invalid entries
+        storeRulesToConfig(processRules);
+        saveConfig();
+    }
+
+    setActiveRules(processRules);
+    refreshRuleList();
+
+    // add process button
     connect(ui.addProcess, &QPushButton::clicked, [this]() {
         addProcess();
         });
 
+    // edit process button / double click
+    connect(ui.editProcess, &QPushButton::clicked, [this]() {
+        editProcess();
+        });
+
+    connect(ui.processExceptionsList, &QListWidget::itemDoubleClicked, [this](QListWidgetItem*) {
+        editProcess();
+        });
+
     // remove process button
     connect(ui.removeProcess, &QPushButton::clicked, [this]() {
-        // Iterate through the selected items and remove them
+        std::vector<int> rows;
+
         for (QListWidgetItem* processException : ui.processExceptionsList->selectedItems()) {
-            delete ui.processExceptionsList->takeItem(ui.processExceptionsList->row(processException));
+            rows.push_back(ui.processExceptionsList->row(processException));
         }
 
-        saveProcessExceptions();
+        // erase from the back so the remaining indices stay valid
+        std::sort(rows.begin(), rows.end(), std::greater<int>());
+
+        for (int row : rows) {
+            processRules.erase(processRules.begin() + row);
+        }
+
+        saveProcessRules();
         });
 
     // limit p-state initially
-    if (setPState(hPhysicalGpus[ui.selectedGPU->currentIndex()], false, config["pstate_limit"]) != 0) {
-        QMessageBox::critical(nullptr, "limit-nvpstate", "Error: Failed to set P-State");
-        exit(1);
-    }
+    applyPState(-1);
 
     if (config["unlimit_trigger"] == 0) {
         setupProcessRunningTrigger();
@@ -214,16 +262,28 @@ limitnvpstate::limitnvpstate(QWidget* parent) : QMainWindow(parent) {
 }
 
 void limitnvpstate::setupProcessRunningTrigger() {
-    isThreadRunning = true;
-    std::thread thread(pollProcesses);
-    thread.detach();
-    //if (thread.joinable()) {
-    //    thread.join();
-    //}
+    {
+        std::lock_guard<std::mutex> lock(pollMutex);
+        pollStop = false;
+        pollWakeUp = false;
+    }
+
+    pollThread = new std::thread(pollProcesses);
 }
 
 void limitnvpstate::stopProcessRunningTrigger() {
-    isThreadRunning = false;
+    {
+        std::lock_guard<std::mutex> lock(pollMutex);
+        pollStop = true;
+    }
+
+    pollCondition.notify_all();
+
+    if (pollThread) {
+        pollThread->join();
+        delete pollThread;
+        pollThread = nullptr;
+    }
 }
 
 void limitnvpstate::setupProcessForegroundTrigger() {
@@ -288,28 +348,43 @@ void limitnvpstate::unlimitTriggerChanged(int index) {
 
     config["unlimit_trigger"] = index;
     saveConfig();
+
+    // apply the state for the current situation right away
+    reevaluatePState();
+}
+
+void limitnvpstate::reevaluatePState() {
+    if (config["unlimit_trigger"] == 0) {
+        // wake up the polling thread so it doesn't wait for the next interval
+        {
+            std::lock_guard<std::mutex> lock(pollMutex);
+            pollWakeUp = true;
+        }
+
+        pollCondition.notify_all();
+    } else {
+        applyForegroundState();
+    }
 }
 
 void limitnvpstate::selectedGPUChanged(int index) {
     // unlimit P-State for current GPU
-    int prevGpuIndex = config["gpu_index"];
+    int prevGpuIndex = activeGpuIndex;
 
-    if (setPState(hPhysicalGpus[prevGpuIndex], true) != 0) {
+    config["gpu_index"] = index;
+    saveConfig();
+    activeGpuIndex = index;
+
+    if (setPState(hPhysicalGpus[prevGpuIndex], 0) != 0) {
         QMessageBox::critical(nullptr, "limit-nvpstate", "Error: Failed to set P-State");
         exit(1);
     }
-
-    // limit P-State for the new GPU
-    config["gpu_index"] = index;
-    saveConfig();
 
     // get available P-States for new GPU selection
     getAvailablePStates();
 
-    if (setPState(hPhysicalGpus[ui.selectedGPU->currentIndex()], false, config["pstate_limit"]) != 0) {
-        QMessageBox::critical(nullptr, "limit-nvpstate", "Error: Failed to set P-State");
-        exit(1);
-    }
+    // limit P-State for the new GPU
+    reevaluatePState();
 }
 
 void limitnvpstate::selectedPStateChanged(int index) {
@@ -320,36 +395,32 @@ void limitnvpstate::selectedPStateChanged(int index) {
 
     std::string selectedPstate = ui.selectedPState->currentText().toStdString().substr(1);
     config["pstate_limit"] = std::stoi(selectedPstate);
+    globalPStateLimit = config["pstate_limit"].get<int>();
     saveConfig();
 
-    // this is required to change the P-State while it is limited
-    // this can be interpreted as setting P0 before switching to the new P-State limit
-    isPStateUnlimited = true;
-
-    if (setPState(hPhysicalGpus[ui.selectedGPU->currentIndex()], false, config["pstate_limit"]) != 0) {
-        QMessageBox::critical(nullptr, "limit-nvpstate", "Error: Failed to set P-State");
-        exit(1);
-    }
+    // the new global limit is applied unless a process rule is active
+    reevaluatePState();
 }
 
-void limitnvpstate::saveProcessExceptions() {
-    // clear items in config
-    config["process_exceptions"].clear();
-    // clear internal list
-    cachedProcessExceptions.clear();
-
-    for (int i = 0; i < ui.processExceptionsList->count(); i++) {
-        std::string processException = ui.processExceptionsList->item(i)->text().toStdString();
-
-        // update config
-        config["process_exceptions"].push_back(processException);
-
-        // update internal list
-        // when the foreground window is changed, the lowercase name of it is compared
-        cachedProcessExceptions.insert(toLower(processException));
-    }
-
+void limitnvpstate::saveProcessRules() {
+    storeRulesToConfig(processRules);
     saveConfig();
+
+    // update the rules used for matching
+    setActiveRules(processRules);
+    refreshRuleList();
+
+    reevaluatePState();
+}
+
+void limitnvpstate::refreshRuleList() {
+    ui.processExceptionsList->clear();
+
+    for (const ProcessRule& rule : processRules) {
+        QListWidgetItem* item = new QListWidgetItem(QString::fromStdString(describeRule(rule)));
+        item->setToolTip(item->text());
+        ui.processExceptionsList->addItem(item);
+    }
 }
 
 void limitnvpstate::closeEvent(QCloseEvent* event) {
@@ -367,58 +438,81 @@ void limitnvpstate::changeEvent(QEvent* e) {
     }
 }
 
-void limitnvpstate::addProcess() {
-    QStringList selectedFilePaths = QFileDialog::getOpenFileNames(
-        this,
-        "Open File",
-        "",
-        tr("Executable Files (*.exe)")
-    );
+namespace {
+    bool isSameTarget(const ProcessRule& a, const ProcessRule& b) {
+        return a.matchPath == b.matchPath && toLower(a.pattern) == toLower(b.pattern);
+    }
+}
 
-    if (selectedFilePaths.isEmpty()) {
+void limitnvpstate::addProcess() {
+    RuleDialog dialog(this, availablePStates);
+
+    if (dialog.exec() != QDialog::Accepted) {
         return;
     }
 
-    std::string programPath = getProgramPath();
-    std::string programExecutableName = getBaseName(programPath);
+    for (const ProcessRule& newRule : dialog.rules()) {
+        // an existing entry for the same target is updated instead of duplicated
+        auto existing = std::find_if(processRules.begin(), processRules.end(), [&](const ProcessRule& rule) {
+            return isSameTarget(rule, newRule);
+            });
 
-    for (QString selectedFilePath : selectedFilePaths) {
-        std::string filePathStr = selectedFilePath.toStdString();
-
-        // replace "/" with "\"
-        std::replace(filePathStr.begin(), filePathStr.end(), '/', '\\');
-
-        std::string executableBaseName = getBaseName(filePathStr);
-
-        if (executableBaseName == programExecutableName) {
-            continue;
-        }
-
-        QString executableName = QString::fromStdString(executableBaseName);
-
-        // don't add if already in list to prevent duplicates
-        if (ui.processExceptionsList->findItems(executableName, Qt::MatchExactly).isEmpty()) {
-            ui.processExceptionsList->addItem(executableName);
+        if (existing != processRules.end()) {
+            *existing = newRule;
+        } else {
+            processRules.push_back(newRule);
         }
     }
 
-    saveProcessExceptions();
+    saveProcessRules();
+}
+
+void limitnvpstate::editProcess() {
+    QList<QListWidgetItem*> selectedItems = ui.processExceptionsList->selectedItems();
+
+    if (selectedItems.size() != 1) {
+        return;
+    }
+
+    int row = ui.processExceptionsList->row(selectedItems.first());
+    ProcessRule current = processRules[row];
+
+    RuleDialog dialog(this, availablePStates, &current);
+
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    const ProcessRule edited = dialog.rules().front();
+    processRules[row] = edited;
+
+    // remove other entries that now point at the same target
+    for (int i = (int)processRules.size() - 1; i >= 0; i--) {
+        if (i != row && isSameTarget(processRules[i], edited)) {
+            processRules.erase(processRules.begin() + i);
+        }
+    }
+
+    saveProcessRules();
 }
 
 void limitnvpstate::getAvailablePStates() {
     NV_GPU_PERF_PSTATES20_INFO pStatesInfo;
     pStatesInfo.version = NV_GPU_PERF_PSTATES20_INFO_VER;
 
-    if (NvAPI_GPU_GetPstates20(hPhysicalGpus[0], &pStatesInfo) != 0) {
+    if (NvAPI_GPU_GetPstates20(hPhysicalGpus[activeGpuIndex], &pStatesInfo) != 0) {
         QMessageBox::critical(nullptr, "limit-nvpstate", "Error: Failed to obtain available P-States");
         exit(1);
     }
 
+    // don't treat the changes made below as user selections
+    QSignalBlocker blocker(ui.selectedPState);
+
     // clear any items already added
     ui.selectedPState->clear();
 
-    // used to validate selection
-    std::vector<int> availablePStates;
+    // used to validate selection and as choices for process rules
+    availablePStates.clear();
 
     for (int i = 1; i < pStatesInfo.numPstates; i++) {
         int pState = pStatesInfo.pstates[i].pstateId;
@@ -439,19 +533,21 @@ void limitnvpstate::getAvailablePStates() {
     std::string selectedPstate = "P" + std::to_string((int)config["pstate_limit"]);
     QString selectedPStateQString = QString::fromStdString(selectedPstate);
     ui.selectedPState->setCurrentText(selectedPStateQString);
+
+    globalPStateLimit = config["pstate_limit"].get<int>();
 }
 
 void limitnvpstate::exitApp(int exitCode) {
-    if (setPState(hPhysicalGpus[ui.selectedGPU->currentIndex()], true) != 0) {
-        QMessageBox::critical(nullptr, "limit-nvpstate", "Error: Failed to set P-State");
-        exit(1);
-    }
-
-    // cleanup
+    // stop the triggers first so they can't limit the P-State again
     if (config["unlimit_trigger"] == 0) {
         stopProcessRunningTrigger();
     } else if (config["unlimit_trigger"] == 1) {
         stopProcessForegroundTrigger();
+    }
+
+    if (setPState(hPhysicalGpus[activeGpuIndex], 0) != 0) {
+        QMessageBox::critical(nullptr, "limit-nvpstate", "Error: Failed to set P-State");
+        exit(1);
     }
 
     exit(exitCode);

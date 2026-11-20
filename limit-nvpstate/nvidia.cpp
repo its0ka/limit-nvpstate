@@ -1,12 +1,13 @@
 #include <iostream>
 #include <nvapi.h>
 #include <Windows.h>
+#include <map>
+#include <mutex>
 
 typedef void* (*QueryPtr)(uint32_t);
 
 HMODULE hNvAPI;
 std::string NVAPI_DLL = "nvapi64.dll";
-bool isPStateUnlimited = true; // for caching purposes
 
 int initNvAPI() {
     if (NvAPI_Initialize() != 0) {
@@ -42,24 +43,35 @@ int NvAPI_GPU_SetPstateClientLimits(NvPhysicalGpuHandle hPhysicalGpu, unsigned i
     return (*pointer)(hPhysicalGpu, pstateType, pStateLimit);
 }
 
-int setPState(NvPhysicalGpuHandle hPhysicalGpu, bool isUnlimit, unsigned int pStateLimit = 0) {
-    if (isUnlimit && !isPStateUnlimited) {
-        if (NvAPI_GPU_SetPstateClientLimits(hPhysicalGpu, 3, 0) != 0) {
-            std::cerr << "error: NvAPI_SetPstateClientLimits failed\n";
-            return 1;
-        }
+int setPState(NvPhysicalGpuHandle hPhysicalGpu, unsigned int pStateLimit) {
+    // can be called from the UI thread and the process polling thread
+    static std::mutex mutex;
+    // last applied limit per GPU (0 = unlimited)
+    static std::map<NvPhysicalGpuHandle, unsigned int> appliedLimits;
 
-        std::cout << "info: set P0\n";
-        isPStateUnlimited = true;
-    } else if (!isUnlimit && isPStateUnlimited) {
-        if (NvAPI_GPU_SetPstateClientLimits(hPhysicalGpu, 3, pStateLimit) != 0) {
-            std::cerr << "error: NvAPI_SetPstateClientLimits failed\n";
-            return 1;
-        }
+    std::lock_guard<std::mutex> lock(mutex);
 
-        std::cout << "info: set P" << pStateLimit << "\n";
-        isPStateUnlimited = false;
+    unsigned int current = 0;
+    auto it = appliedLimits.find(hPhysicalGpu);
+    if (it != appliedLimits.end()) {
+        current = it->second;
     }
 
+    if (current == pStateLimit) {
+        return 0;
+    }
+
+    if (NvAPI_GPU_SetPstateClientLimits(hPhysicalGpu, 3, pStateLimit) != 0) {
+        std::cerr << "error: NvAPI_SetPstateClientLimits failed\n";
+        return 1;
+    }
+
+    if (pStateLimit == 0) {
+        std::cout << "info: set P0 (unlimited)\n";
+    } else {
+        std::cout << "info: set P" << pStateLimit << "\n";
+    }
+
+    appliedLimits[hPhysicalGpu] = pStateLimit;
     return 0;
 }

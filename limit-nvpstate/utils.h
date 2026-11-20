@@ -11,3 +11,6 @@ std::string toLower(std::string str);
 std::string getBaseName(std::string& fullPath);
 std::string wStringToString(const std::wstring& wstr);
 std::string getProcessNameByPID(DWORD pid);
+std::wstring stringToWString(const std::string& str);
+// full Win32 path of the process image (UTF-8), empty if it can't be queried
+std::string getProcessImagePath(DWORD pid);

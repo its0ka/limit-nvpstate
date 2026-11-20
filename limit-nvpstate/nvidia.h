@@ -3,7 +3,8 @@
 #include <iostream>
 #include <nvapi.h>
 
-extern bool isPStateUnlimited;
-
 int initNvAPI();
-int setPState(NvPhysicalGpuHandle hPhysicalGpu, bool isUnlimit, unsigned int pStateLimit = 0);
+
+// pStateLimit: 0 = unlimited (P0), N = limit the GPU to P<N>
+// the last applied limit is cached per GPU so redundant driver calls are skipped
+int setPState(NvPhysicalGpuHandle hPhysicalGpu, unsigned int pStateLimit);

@@ -9,20 +9,20 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>480</width>
-    <height>270</height>
+    <width>640</width>
+    <height>300</height>
    </rect>
   </property>
   <property name="minimumSize">
    <size>
-    <width>480</width>
-    <height>240</height>
+    <width>640</width>
+    <height>300</height>
    </size>
   </property>
   <property name="maximumSize">
    <size>
-    <width>480</width>
-    <height>270</height>
+    <width>640</width>
+    <height>300</height>
    </size>
   </property>
   <property name="windowTitle">
@@ -38,12 +38,12 @@
      <widget class="QGroupBox" name="groupBox">
       <property name="maximumSize">
        <size>
-        <width>300</width>
+        <width>400</width>
         <height>16777215</height>
        </size>
       </property>
       <property name="title">
-       <string>Process Exceptions</string>
+       <string>Process Exceptions (own P-State)</string>
       </property>
       <layout class="QVBoxLayout" name="verticalLayout_3">
        <item>
@@ -55,6 +55,13 @@
           <widget class="QPushButton" name="addProcess">
            <property name="text">
             <string>Add</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="editProcess">
+           <property name="text">
+            <string>Edit</string>
            </property>
           </widget>
          </item>
@@ -87,7 +94,7 @@
       <item>
        <widget class="QGroupBox" name="groupBox_3">
         <property name="title">
-         <string>Limit P-State</string>
+         <string>Default P-State Limit</string>
         </property>
         <layout class="QHBoxLayout" name="horizontalLayout_4">
          <item>
@@ -117,7 +124,7 @@
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>480</width>
+     <width>640</width>
      <height>20</height>
     </rect>
    </property>
