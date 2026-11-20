@@ -4,6 +4,8 @@
 #include <vector>
 #include <rules.h>
 
+class QTimer;
+
 class limitnvpstate : public QMainWindow {
     Q_OBJECT
 
@@ -27,6 +29,9 @@ private:
     std::vector<ProcessRule> processRules;
     // P-States of the selected GPU that can be used as a limit (excludes P0)
     std::vector<int> availablePStates;
+
+    // periodic re-check while the foreground trigger is active
+    QTimer* foregroundTimer = nullptr;
 
 private slots:
     void unlimitTriggerChanged(int index);

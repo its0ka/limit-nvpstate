@@ -9,6 +9,7 @@
 #include <QFileDialog>
 #include <QCloseEvent>
 #include <QSignalBlocker>
+#include <QTimer>
 #include <about.h>
 #include <tlhelp32.h>
 #include <algorithm>
@@ -46,10 +47,22 @@ void applyPState(int rulePState) {
 void applyForegroundState() {
     HWND hwnd = GetForegroundWindow();
 
+    // during window transitions (alt-tab, fullscreen switches, UAC) there can be no foreground window for a moment
+    // keep the current state instead of dropping to the global limit while a game is about to regain focus
+    if (!hwnd) {
+        return;
+    }
+
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
 
-    std::string processName = getProcessNameByPID(pid);
+    std::string processName = pid != 0 ? getProcessNameByPID(pid) : "";
+
+    // same if the process can't be identified right now
+    if (processName.empty()) {
+        return;
+    }
+
     int rulePState = findRulePState(processName, pid);
 
     std::cout << "info: " << processName << " is fg window (rule P-State: " << rulePState << ")\n";
@@ -293,9 +306,24 @@ void limitnvpstate::setupProcessForegroundTrigger() {
         QMessageBox::critical(nullptr, "limit-nvpstate", "Error: Failed to configure global hook");
         exit(1);
     }
+
+    // safety net: foreground events can be missed or arrive while the foreground window is in transition,
+    // so the state is re-checked periodically (cheap, the applied P-State is cached)
+    if (!foregroundTimer) {
+        foregroundTimer = new QTimer(this);
+        connect(foregroundTimer, &QTimer::timeout, []() {
+            applyForegroundState();
+            });
+    }
+
+    foregroundTimer->start(1000);
 }
 
 void limitnvpstate::stopProcessForegroundTrigger() {
+    if (foregroundTimer) {
+        foregroundTimer->stop();
+    }
+
     if (!UnhookWinEvent(eventHook)) {
         QMessageBox::critical(nullptr, "limit-nvpstate", "Error: Failed to unhook global hook");
         exit(1);
